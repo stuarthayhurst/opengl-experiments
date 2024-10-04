@@ -2,7 +2,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
-#include <queue>
 #include <thread>
 
 #include "../../types.hpp"
@@ -18,44 +17,84 @@ namespace {
     AmmoniteGroup* group;
   };
 
-  //Implements a thread-safe queue to store and retrieve jobs from
+  struct Node {
+    WorkItem workItem;
+    Node* nextNode;
+  };
+
   class WorkQueue {
   private:
-    std::queue<WorkItem> queue;
-    std::mutex queueLock;
+    std::mutex readMutex;
+    Node* nextPopped;
+    std::atomic<Node*> nextPushed;
 
   public:
+    WorkQueue() {
+      //Start with an empty queue, 1 'old' node
+      nextPushed = new Node{{nullptr, nullptr, nullptr}, nullptr};
+      nextPopped = nextPushed;
+    }
+
+    ~WorkQueue() {
+      //Clear out any remaining nodes
+      WorkItem workItem;
+      do {
+        this->pop(&workItem);
+      } while (workItem.work != nullptr);
+
+      //Clear up next free node
+      delete nextPopped;
+    }
+
     void push(AmmoniteWork work, void* userPtr, AmmoniteGroup* group) {
-      queueLock.lock();
-      queue.push({work, userPtr, group});
-      queueLock.unlock();
+      //Create a new empty node
+      Node* newNode = new Node{{nullptr, nullptr, nullptr}, nullptr};
+
+      //Atomically swap the next node with newNode, then fill in the old new node now it's free
+      *(nextPushed.exchange(newNode)) = {{work, userPtr, group}, newNode};
     }
 
     void pushMultiple(AmmoniteWork work, void* userBuffer, int stride,
-                      AmmoniteGroup* group, unsigned int count) {
-      //Add multiple jobs in 1 pass
-      queueLock.lock();
+                                AmmoniteGroup* group, unsigned int count) {
+      //Generate section of linked list to insert
+      Node* newNode = new Node{{nullptr, nullptr, nullptr}, nullptr};
+      Node sectionStart;
+      Node* sectionPtr = &sectionStart;
       if (userBuffer == nullptr) {
         for (unsigned int i = 0; i < count; i++) {
-          queue.push({work, nullptr, group});
+          sectionPtr->nextNode = new Node{{work, nullptr, group}, nullptr};
+          sectionPtr = sectionPtr->nextNode;
         }
       } else {
         for (unsigned int i = 0; i < count; i++) {
-          queue.push({work, (void*)((char*)userBuffer + (std::size_t)(i) * stride), group});
+          sectionPtr->nextNode = new Node{{
+            work, (void*)((char*)userBuffer + (std::size_t)(i) * stride), group}, nullptr};
+          sectionPtr = sectionPtr->nextNode;
         }
       }
-      queueLock.unlock();
+
+      //Insert the generated section atomically
+      sectionPtr->nextNode = newNode;
+      *(nextPushed.exchange(newNode)) = *sectionStart.nextNode;
+      delete sectionStart.nextNode;
     }
 
     void pop(WorkItem* workItemPtr) {
-      queueLock.lock();
-      if (!queue.empty()) {
-        *workItemPtr = queue.front();
-        queue.pop();
+      //Use the most recently popped node to find the next
+      readMutex.lock();
+
+      //Copy the data and free the old node, otherwise return if we don't have a new node
+      Node* currentNode = nextPopped;
+      if (currentNode->nextNode != nullptr) {
+        nextPopped = nextPopped->nextNode;
+        readMutex.unlock();
+
+        *workItemPtr = currentNode->workItem;
+        delete currentNode;
       } else {
+        readMutex.unlock();
         workItemPtr->work = nullptr;
       }
-      queueLock.unlock();
     }
   };
 }
